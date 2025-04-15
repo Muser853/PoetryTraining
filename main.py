@@ -29,6 +29,7 @@ class PoemDataset(torch.utils.data.Dataset): # data preprocessing
                 'pinyinDict.json'
             )
         )
+
         self.english_phonetic_dict = self._load_phonetic_dict(
             os.path.join(
                 script_dir,

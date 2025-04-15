@@ -38,7 +38,11 @@ class PoemDataset(torch.utils.data.Dataset):
         )
         # with open('pinyinDict.json') as f: self.chinese_phonetic_dict = json.load(f)
         # with open('PHONETICDICTIONARY/phonetic-dictionary.json') as f: self.english_phonetic_dict = json.load(f)
-        print(list(self.chinese_phonetic_dict.items())[0] if self.chinese_phonetic_dict else "Empty dictionary")
+        print(list(
+            self.chinese_phonetic_dict.items()
+                   )[0]
+              if self.chinese_phonetic_dict else "Empty dictionary"
+        )
 
     @staticmethod
     def _load_polyphonic_dict(file_path):
