@@ -3,28 +3,42 @@ import os
 import json
 import math
 import torch
-import torch.nn.functional as F
+import torch.nn.functional
 from torch import nn
-from transformers import BertModel, Trainer, TrainingArguments, BertTokenizer
+from transformers import BertModel, Trainer, TrainingArguments, DataCollatorForSeq2Seq, BertTokenizer
 from bert_score import BERTScorer
 from collections import defaultdict
 
-class PoemDataset(torch.utils.data.Dataset):  # data preprocessing
-    def __init__(self, data, max_length=128):
+class PoemDataset(torch.utils.data.Dataset):
+    def __init__(self, data, max_length=512):
+        self.MAX_LINES = 6
         self.data = data
         self.max_length = max_length
         self.chinese_tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
         self.english_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-        self.tone_mapping = {'平': ['1', '2'], '仄': ['3', '4']}  # mapping to flat / sharp tone
+
+        self.tone_mapping = {
+            '平': ['1', '2'], '仄': ['3', '4']
+        }  # mapping to flat / sharp tone
+
         script_dir = os.path.dirname(os.path.abspath(__file__))
+
         self.chinese_phonetic_dict = self._load_polyphonic_dict(
-            os.path.join(script_dir, 'pinyinDict.json')
+            os.path.join(
+                script_dir,
+                'pinyinDict.json'
+            )
         )
+
         self.english_phonetic_dict = self._load_phonetic_dict(
-            os.path.join(script_dir, 'PHONETICDICTIONARY/English-phonetic-transcription.json')
+            os.path.join(
+                script_dir,
+                'PHONETICDICTIONARY/English-phonetic-transcription.json'
+            )
         )
         # with open('pinyinDict.json') as f: self.chinese_phonetic_dict = json.load(f)
         # with open('PHONETICDICTIONARY/phonetic-dictionary.json') as f: self.english_phonetic_dict = json.load(f)
+        print(list(self.chinese_phonetic_dict.items())[0] if self.chinese_phonetic_dict else "Empty dictionary")
 
     @staticmethod
     def _load_polyphonic_dict(file_path):
@@ -33,12 +47,16 @@ class PoemDataset(torch.utils.data.Dataset):  # data preprocessing
                 raw_dict = json.load(f)
 
             validated_dict = defaultdict(list)
+
             for char, pinyins in raw_dict.items():
                 if not isinstance(pinyins, list):
                     raise ValueError(f"Invalid pinyin format for {char}, expected list")
 
                 # clean the data and preserve polyphones for Chinese characters
-                cleaned = [p.strip().lower() for p in pinyins if p.strip()]
+                cleaned = [
+                    p.strip().lower() for p in pinyins if p.strip()
+                ]
+
                 if not cleaned:
                     raise ValueError(f"No valid pinyin for {char}")
 
@@ -47,7 +65,9 @@ class PoemDataset(torch.utils.data.Dataset):  # data preprocessing
             return validated_dict
 
         except Exception as e:
-            raise RuntimeError(f"Failed to load pinyinDict.json: {str(e)}")
+            raise RuntimeError(
+                f"Failed to load pinyinDict.json: {str(e)}"
+            )
 
     @staticmethod
     def _load_phonetic_dict(file_path):
@@ -56,43 +76,40 @@ class PoemDataset(torch.utils.data.Dataset):  # data preprocessing
                 raw_dict = json.load(f)
 
             validated_dict = defaultdict(list)
-            for word, phon_str in raw_dict.items():
+            for word, phonemes in raw_dict.items():
+                clean_word = re.sub(r'^"|"$', '', word).lower().strip()  # remove ""
 
-                clean_word = re.sub(r'\(\d+\)$', '', word).lower().strip()
+                if isinstance(phonemes, str):
+                    variants = [phonemes.split()]
+                elif isinstance(phonemes, list):
+                    variants = []
+                    for p in phonemes:
+                        if isinstance(p, str):
+                            variants.extend(p.split())
+                        elif isinstance(p, list):
+                            variants.extend(p)
+                        else:
+                            raise ValueError(f"Invalid phonemes format for {word}")
+                else:
+                    raise ValueError(f"Invalid phonemes format for {word}")
 
-                phonemes = []
-                current_phon = []
-                for char in phon_str:
-                    if char.isalpha() or char.isdigit():
-                        current_phon.append(char)
-                    elif current_phon:  # save current phonetics by split
-                        phonemes.append(''.join(current_phon))
-                        current_phon = []
+                validated_phon = []
 
-                # addLast
-                if current_phon:
-                    phonemes.append(''.join(current_phon))
+                for variant in variants:
+                    variant_lower = [
+                        v.lower()
+                        for v in variant
+                    ]
 
-                for ph in phonemes:
-                    if not re.match(r'^[A-Za-z0-9]+$', ph):
-                        raise ValueError(f"Invalid phoneme: {ph} in {word}")
+                    validated_phon.append(' '.join(variant_lower))
 
-                validated_dict[clean_word].append(phonemes)
+                validated_dict[clean_word] = validated_phon
 
-            # remove repetitions
-            final_dict = defaultdict(list)
-            for word, variants in validated_dict.items():
-                seen = set()
-                for var in variants:
-                    key = '-'.join(var)
-                    if key not in seen:
-                        seen.add(key)
-                        final_dict[word].append(var)
-
-            return final_dict
-
+            return validated_dict
         except Exception as e:
-            raise RuntimeError(f"Failed to load {file_path}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to load {file_path}: {str(e)}"
+            )
 
     @staticmethod
     def _phonetic_similarity(chn_phon, eng_phon):
@@ -114,19 +131,40 @@ So far: The common pronunciation is selected first, and the context-based disamb
     def _get_english_phonemes(self, word):
         word = word.lower().strip()
         variants = self.english_phonetic_dict.get(word, [])
-        return variants[0] if variants else []  # return the first so far
+
+        if variants:
+
+            if isinstance(variants[0], list):
+                return [' '.join(v) for v in variants[0]]
+            else:
+                return [' '.join(variants)]
+        return []
 
     def _get_structural_labels(self, poem):
+        valid_poem = [
+            line.strip()
+            for line in poem
+            if len(line.strip()) > 0
+        ]
+
+        last_chars = []
+
+        for line in valid_poem:
+            if not line:
+                last_chars.append('*')
+            else:
+                last_chars.append(line[-1])
+
         labels = []
-        last_chars = [line.strip()[-1] for line in poem]
         current_rhymes = {}
         rhyme_code = []
 
-        for line in poem:
+        for line in valid_poem:
             line_labels = []
+
             for char in line:
                 pinyin = self.chinese_phonetic_dict.get(char, '')
-                tone = pinyin[-1] if pinyin else ''
+                tone = pinyin[-1] if pinyin and len(pinyin) > 0 else ''
                 label = '平' if tone in self.tone_mapping['平'] else '仄'
                 line_labels.append(label)
 
@@ -148,121 +186,244 @@ So far: The common pronunciation is selected first, and the context-based disamb
     def _align_pronunciation(self, chn_phon, eng_phon):
         alignment_scores = []
         for c_p, e_p in zip(chn_phon, eng_phon):
-            e_pinyin = self.english_phonetic_dict.get(e_p, [''])[0]  # English list
+            e_p_clean = e_p.lower().strip()
+
+            e_pinyin = self.english_phonetic_dict.get(e_p_clean, [['UNK']])
+            if e_pinyin and isinstance(e_pinyin[0], list) and e_pinyin[0]:
+                e_pinyin = e_pinyin[0][0]
+            else:
+                e_pinyin = 'UNK'
+
             score = self._phonetic_similarity(c_p, e_pinyin)
             alignment_scores.append(score)
+
         return sum(alignment_scores) / len(alignment_scores) if alignment_scores else 0.0
 
+    def __len__(self):
+        return len(self.data)
+
     def __getitem__(self, idx):
-        item = self.data[idx]
+        try:
+            item = self.data[idx]
+            chn_lines = item['chinese']
+            structural_features = self._get_structural_labels(chn_lines)
 
-        chn_lines = item['chinese']
-        structural_labels = self._get_structural_labels(chn_lines)
+            structural_tone = torch.tensor(
+                [0 if c == '平' else 1 for c in ''.join(structural_features['tone_labels'])],
+                dtype=torch.long
+            )
+            structural_rhyme = torch.tensor(
+                [ord(c) - ord('A') for c in structural_features['rhyme_scheme']],
+                dtype=torch.long
+            )
+            # structural labeling
+            src_text = f'[RHYME_SCHEME:{" ".join(structural_features["rhyme_scheme"])}] ' \
+                f'[TONE:{" ".join(["".join(l) for l in structural_features["tone_labels"]])}] ' \
+                f'[TEXT] ' + ' '.join(chn_lines)
 
-        # structural labeling
-        src_text = f'[RHYME_SCHEME:{" ".join(structural_labels["rhyme_scheme"])}] ' \
-                   f'[TONE:{" ".join(["".join(l) for l in structural_labels["tone_labels"]])}] ' \
-                   f'[TEXT] ' + ' '.join(chn_lines)
+            eng_lines = item['english']
 
-        eng_lines = item['english']
+            src_encoding = self.chinese_tokenizer(
+                src_text,
+                max_length=self.max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            eng_encoding = self.english_tokenizer(
+                ' '.join(eng_lines),
+                max_length=self.max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
 
-        # feature extraction
-        chn_phon = [self.chinese_phonetic_dict.get(c, [''])[0] for c in ''.join(chn_lines)]
-        eng_phon = []
-        for w in ' '.join(eng_lines).split():
-            phonemes = self._get_english_phonemes(w)
-            eng_phon.append(''.join(phonemes) if phonemes else '')
+            # feature extraction
+            chn_phon = [self.chinese_phonetic_dict.get(c, [''])[0] for c in ''.join(chn_lines)]
+            eng_phon = []
 
-        pron_score = self._align_pronunciation(chn_phon, eng_phon)
+            for w in ' '.join(eng_lines).split():
+                phonemes = self._get_english_phonemes(w)
 
-        src_encoding = self.chinese_tokenizer(
-            src_text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        tokens = self.english_tokenizer.EncodeAsIds(' '.join(eng_lines))  # encode into ID list
+                eng_phon.append(
+                    ' '.join(phonemes)
+                    if phonemes else ''
+                )
 
-        if len(tokens) > self.max_length:
-            tokens = tokens[:self.max_length]
-        else:  # cut and pad
-            tokens += [0] * (self.max_length - len(tokens))
+            pron_score = self._align_pronunciation(chn_phon, eng_phon)
+            pron_features = {  # feature calculation
+                'half_match': [],
+                'consecutive_match': [],
+                'odd_even_match': 0.0
+            }
+            for chn_line, eng_line in zip(chn_lines, eng_lines):
+                # pinyin extraction with 1 character having multiple pronunciations
+                chn_phons = [
+                    self.chinese_phonetic_dict.get(
+                        c, ['']
+                    )[0]
+                    for c in chn_line
+                ]
 
-        tgt_encoding = torch.tensor(tokens)
+                eng_phons = []
 
-        pron_features = {  # feature calculation
-            'half_match': [],
-            'consecutive_match': [],
-            'odd_even_match': 0.0
-        }
-        for chn_line, eng_line in zip(chn_lines, eng_lines):
-            # pinyin extraction with 1 character having multiple pronunciations
-            chn_phons = [self.chinese_phonetic_dict.get(c, [''])[0] for c in chn_line]
-            eng_phons = [self.english_phonetic_dict.get(w.lower(), [''])[0] for w in eng_line.split()]
-            score = self._align_pronunciation(chn_phons, eng_phons)
-            pron_features['half_match'].append(score)
+                for w in eng_line.split():
+                    phonemes = self._get_english_phonemes(w)
 
-        for i in range(len(chn_lines) - 1):
-            chn1_phon = [self.chinese_phonetic_dict.get(c, [''])[0] for c in chn_lines[i]]
-            chn2_phon = [self.chinese_phonetic_dict.get(c, [''])[0] for c in chn_lines[i + 1]]
-            eng1_phon = [self.english_phonetic_dict.get(w.lower(), [''])[0] for w in eng_lines[i].split()]
-            eng2_phon = [self.english_phonetic_dict.get(w.lower(), [''])[0] for w in eng_lines[i + 1].split()]
-            score = self._align_pronunciation(chn1_phon, eng1_phon) + self._align_pronunciation(chn2_phon, eng2_phon)
-            pron_features['consecutive_match'].append(score)
+                    eng_phons.append(
+                        ' '.join(phonemes)
+                        if phonemes else ''
+                    )
 
-        odd_phon = ''.join(
-            [p for line in chn_lines[::2] for c in line for p in self.chinese_phonetic_dict.get(c, [''])])
-        even_phon = ''.join(
-            [p for line in chn_lines[1::2] for c in line for p in self.chinese_phonetic_dict.get(c, [''])])
-        odd_eng_phon = ''.join([p for line in eng_lines[::2] for w in line.split() for p in
-                                self.english_phonetic_dict.get(w.lower(), [''])])
-        even_eng_phon = ''.join([p for line in eng_lines[1::2] for w in line.split() for p in
-                                 self.english_phonetic_dict.get(w.lower(), [''])])
+                score = self._align_pronunciation(chn_phons, eng_phons)
+                pron_features['half_match'].append(score)
 
-        pron_features['odd_even_match'] = (
-                                                  self._align_pronunciation(odd_phon, odd_eng_phon) +
-                                                  self._align_pronunciation(even_phon, even_eng_phon)
-                                          ) / 2.0  # average
+            for i in range(len(chn_lines) - 1):
+                chn1_phon = [
+                    self.chinese_phonetic_dict.get(c, [''])[0]
+                    for c in chn_lines[i]
+                ]
 
-        return {
-            'input_ids': src_encoding['input_ids'].squeeze(),
-            'attention_mask': src_encoding['attention_mask'].squeeze(),
-            'labels': torch.tensor(tgt_encoding),
-            'pron_features': pron_features,
-            'rhyme_pattern': structural_labels['rhyme_scheme'],
-            "prone_score": torch.tensor(pron_score)
-        }
+                chn2_phon = [
+                    self.chinese_phonetic_dict.get(c, [''])[0]
+                    for c in chn_lines[i + 1]
+                ]
 
+                eng1_phon = [
+                    ' '.join(self.english_phonetic_dict.get(w.lower(), [''])[0])
+                    for w in eng_lines[i].split()
+                ]
+                eng2_phon = [
+                    ' '.join(self.english_phonetic_dict.get(w.lower(), [''])[0])
+                    for w in eng_lines[i + 1].split()
+                ]
+
+                score = self._align_pronunciation(chn1_phon, eng1_phon) + self._align_pronunciation(chn2_phon, eng2_phon)
+                pron_features['consecutive_match'].append(score)
+
+            odd_phon = ''.join(
+                [
+                    p for line in chn_lines[::2]
+                    for c in line
+                    for p in self.chinese_phonetic_dict.get(c, [''])
+                ]
+            )
+
+            even_phon = ''.join(
+                [
+                    p for line in chn_lines[1::2]
+                    for c in line
+                    for p in self.chinese_phonetic_dict.get(c, [''])
+                ]
+            )
+
+            odd_eng_phon = ''.join(
+                [
+                ' '.join(p)
+                    for line in eng_lines[::2]
+                    for w in line.split()
+                    for p in self.english_phonetic_dict.get(w.lower(), [''])
+                ]
+            )
+            even_eng_phon = ''.join([
+                ' '.join(p)
+                for line in eng_lines[1::2]
+                for w in line.split()
+                for p in self.english_phonetic_dict.get(w.lower(), [''])
+            ])
+
+            pron_features['odd_even_match'] = (
+                self._align_pronunciation(odd_phon, odd_eng_phon) +
+                self._align_pronunciation(even_phon, even_eng_phon)
+            ) / 2.0  # average
+
+            half_match = (pron_features['half_match'] + [0]*
+                (
+                    self.MAX_LINES - len(
+                        pron_features['half_match']
+                    )
+                )
+            )
+            consecutive_match = (pron_features['consecutive_match'] + [0]*
+                 (
+                        self.MAX_LINES-1 - len(
+                             pron_features['consecutive_match']
+                      )
+                )
+            )
+            
+            return {
+                'input_ids': src_encoding['input_ids'].squeeze(),
+                'attention_mask': src_encoding['attention_mask'].squeeze(),
+                'labels': eng_encoding['input_ids'].squeeze(),
+
+                "half_match": torch.tensor(
+                    half_match, dtype=torch.float
+                ).unsqueeze(0),  # dimension processing
+
+                'consecutive_match': torch.tensor(
+                    consecutive_match, dtype=torch.float
+                ).unsqueeze(0),
+
+                'structural_tone': structural_tone,
+                'structural_rhyme': structural_rhyme,
+                'rhyme_pattern': structural_rhyme,
+
+                "odd_even_match": torch.tensor(
+                    pron_features['odd_even_match']
+                ),
+
+                "pron_score": torch.tensor(pron_score),
+            }
+        except Exception as e:
+            print(f"Error processing item {idx}: {e}")
+            return None # index out of range
 
 # explicit model architecture
 class BidirectionalEncoder(nn.Module):  # bidirectional structural awareness encoder
     def __init__(self):
         super().__init__()
         self.bert = BertModel.from_pretrained('bert-base-chinese')
-        self.tone_embedding = nn.Embedding(2, 768)  # 平仄嵌入
-        self.rhyme_embedding = nn.Embedding(10, 768)  # 押韵模式嵌入
+
+        self.tone_embedding = nn.Embedding(
+            2,
+            768
+        )  # flat / sharp embeddings
+
+        self.rhyme_embedding = nn.Embedding(
+            10,
+            768
+        )  # rhyming pattern embeddings
+
+        self.fusion_linear = nn.Linear(
+            2304,
+            768
+        )
 
         # fix BERT parameters
         for param in self.bert.parameters():
             param.requires_grad = False
 
-    def forward(self, input_ids, structural_features):
+    def forward(self, input_ids, attention_mask, structural_features):
         device = input_ids.device
-        outputs = self.bert(input_ids=input_ids)
+        outputs = self.bert(
+            input_ids=input_ids, attention_mask=attention_mask
+        )
         hidden_states = outputs.last_hidden_state
+        structural_tone = structural_features['tone_labels']
+        structural_rhyme = structural_features['rhyme_pattern']
+        tone_emb = self.tone_embedding(structural_tone.to(device))
+        rhyme_emb = self.rhyme_embedding(structural_rhyme.to(device))
 
-        tone_emb = self.tone_embedding(
-            torch.tensor([0 if c == '平' else 1 for c in ''.join(structural_features['tone'])], device=device)
+        fusion_input = torch.cat([
+            hidden_states.mean(dim=1),  # (batch_size, 768)
+            tone_emb.mean(dim=1),       # seq dim mean
+            rhyme_emb.mean(dim=1)
+            ], dim=-1
         )
-        rhyme_emb = self.rhyme_embedding(
-            torch.tensor([ord(c) - ord('A') for c in structural_features['rhyme']], device=device)
-        )
-        fusion_input = torch.cat([hidden_states.mean(dim=1), tone_emb.mean(dim=0), rhyme_emb.mean(dim=0)], dim=-1)
-        fusion_gate = torch.sigmoid(nn.Linear(fusion_input.size(-1), 768)(fusion_input))
 
+        fusion_gate = torch.sigmoid(self.fusion_linear(fusion_input))
         return hidden_states * fusion_gate.unsqueeze(1)
-
 
 class PronunciationMatcher(nn.Module):
     def __init__(self, hidden_size=768):
@@ -285,74 +446,98 @@ class PronunciationMatcher(nn.Module):
 
         return torch.stack(alignment).mean()
 
-
 class StructureAwareDecoder(nn.Module):
     def __init__(self):
         super().__init__()
+
         self.layers = nn.ModuleList([
             nn.TransformerDecoderLayer(d_model=768, nhead=8)
             for _ in range(6)
         ])
+
         self.pronunciation_match = PronunciationMatcher()
 
     def forward(self, x, memory, rhyme_pattern):
-        # rhyme constraint attention
         for layer in self.layers:
-            x = layer(
-                x,
-                memory,
-                tgt_mask=self._generate_rhyme_mask(
-                    rhyme_pattern,
-                    batch_size=x.size(0),
-                    seq_len=x.size(1),
-                    device=x.device
-                )
+            mask = self._generate_rhyme_mask(
+                pattern=rhyme_pattern,
+                seq_len=x.size(0),  # seq length dimension
+                device=x.device
             )
+
+            x = layer(x, memory, tgt_mask=mask)
+
         pron_scores = self.pronunciation_match(memory, x)
         return x + pron_scores.unsqueeze(-1)
 
     @staticmethod
-    def _generate_rhyme_mask(pattern, batch_size, seq_len, device):
-        mask = torch.ones(batch_size, seq_len, device=device)  # generate rhyming attention mask
+    def _generate_rhyme_mask(pattern, seq_len, device):
+        mask = torch.ones(seq_len, seq_len, device=device)
 
-        for i, pos in enumerate(pattern):  # enhance attention mask at the rhyming position
-            mask[i, pos] *= 2.0
+        for pos in pattern:
+            mask[pos, :] *= 2.0
+
         return mask
 
-
 class PoetryTranslator(nn.Module):
-    """the translation model"""
-
     def __init__(self):
         super().__init__()
         self.encoder = BidirectionalEncoder()
         self.decoder = StructureAwareDecoder()
         self.pronunciation_loss = nn.CosineEmbeddingLoss()
 
-    def forward(self, batch):
-        structural_features = {
-            'tone': batch['tone_labels'],
-            'rhyme': batch['rhyme_pattern'],
-            'pron_features': batch['pron_features']
-        }
-        memory = self.encoder(batch['input_ids'], structural_features)
-        outputs = self.decoder(
-            batch['labels'],
-            memory,
-            rhyme_pattern=batch['rhyme_pattern']
-        )
-        translation_loss = F.cross_entropy(outputs.logits, batch['labels'])
-        # integrate pronunciation loss
-        pronunciation_loss = (
-                torch.mean(torch.stack(batch['pron_features']['half_match'])) +
-                torch.mean(torch.stack(batch['pron_features']['consecutive_match'])) +
-                batch['pron_features']['odd_even_match']
+        self.decoder_embedding = nn.Embedding(
+            BertTokenizer.from_pretrained('bert-base-uncased').vocab_size, 
+            768
         )
 
-        prone_loss = F.mse_loss(
-            batch['pron_features']['prone_score'],
-            torch.tensor([0.8] * len(batch['pron_features']['prone_score']), device=batch['prone_score'].device)
+        self.fc = nn.Linear(
+            768, BertTokenizer.from_pretrained('bert-base-uncased').vocab_size
         )
+
+    def forward(self, input_ids, attention_mask, structural_tone, structural_rhyme,
+                labels, half_match, consecutive_match, odd_even_match, rhyme_pattern):
+
+        memory = self.encoder(
+            input_ids,
+            attention_mask=attention_mask,
+            structural_features={
+                'tone_labels': structural_tone,
+                'rhyme_pattern': structural_rhyme
+            }
+        ).permute(1, 0, 2)
+
+        decoder_inputs = labels[ : , : -1]
+
+        decoder_emb = self.decoder_embedding(
+            decoder_inputs
+        ).permute(1, 0, 2)
+
+        outputs = self.decoder(
+            decoder_emb, memory, rhyme_pattern
+        )
+
+        logits = self.fc(
+            outputs.permute(1, 0, 2)
+        )
+
+        translation_loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels[:, 1:].contiguous().view(-1)
+        )
+
+        pronunciation_loss = (
+                half_match.mean() + consecutive_match.mean() + odd_even_match
+        )
+
+        target = torch.tensor(
+            0.8, device=input_ids.device).expand_as(pronunciation_loss
+        )
+
+        prone_loss = torch.nn.functional.mse_loss(
+            pronunciation_loss, target
+        )
+
         return translation_loss + 0.5 * pronunciation_loss + 0.3 * prone_loss
 
 
@@ -367,18 +552,22 @@ class RhymeConstrainedGenerator:
         # dynamically add rhyming constraints
         constraints = []
         for line_idx, rhyme_char in enumerate(inputs['rhyme_pattern']):
-            target_phonemes = self.english_phonetic_dict.get(rhyme_char, [''])[0]
+            target_phonemes = self.english_phonetic_dict.get(
+                rhyme_char, ['']
+            )[0]
+
             constraints.append({
                 'position': -1,
                 'phonemes': [target_phonemes]
             })
+
         self.beam_scorer.constraints = constraints
+
         return self.model.generate(
             inputs,
             beam_scorer=self.beam_scorer,
             max_length=128
         )
-
 
 def train():  # training and evaluation
     dataset = PoemDataset([
@@ -418,7 +607,9 @@ def train():  # training and evaluation
             'rhyme_labels': [0, 0, 0]
         }
     ])
+
     model = PoetryTranslator()
+
     args = TrainingArguments(
         output_dir='./results',
         learning_rate=3e-5,
@@ -431,10 +622,15 @@ def train():  # training and evaluation
 
     def compute_metrics(pred):
         # decode prediction and tokens
-        pred_text = [dataset.english_tokenizer.Decode(ids) for ids in pred.predictions]
-        label_text = [dataset.english_tokenizer.Decode(ids) for ids in pred.label_ids]
+        pred_text = [
+            dataset.english_tokenizer.Decode(ids) for ids in pred.predictions
+        ]
 
-        P, R, F1 = BERTScorer(lang="en", rescale_with_baseline=True).score(cands=pred_text, refs=label_text)
+        label_text = [
+            dataset.english_tokenizer.Decode(ids) for ids in pred.label_ids
+        ]
+
+        p, r, f1 = BERTScorer(lang="en", rescale_with_baseline=True).score(cands=pred_text, refs=label_text)
 
         rhyme_acc = 0.0  # calculate rhyming accuracy
         for pred_line, label_line in zip(pred_text, label_text):
@@ -444,20 +640,26 @@ def train():  # training and evaluation
             rhyme_acc += 1 if pred_rhyme == label_rhyme else 0
 
         return {
-            'bert_score_precision': P.mean().item(),
-            'bert_score_recall': R.mean().item(),
-            'bert_score_f1': F1.mean().item(),
+            'bert_score_precision': p.mean().item(),
+            'bert_score_recall': r.mean().item(),
+            'bert_score_f1': f1.mean().item(),
             'rhyme_acc': rhyme_acc / len(pred_text)
         }
+
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=dataset.english_tokenizer,
+        model=model,
+        padding=True
+    )
 
     trainer = Trainer(
         model=model,
         args=args,
-        train_dataset=dataset,
+        train_dataset=[x for x in dataset if x is not None],
+        data_collator=data_collator,
         compute_metrics=compute_metrics
     )
     trainer.train()
-
 
 """
 1. Structure enhancement encoder: 
@@ -465,8 +667,7 @@ def train():  # training and evaluation
 - The gating mechanism dynamically incorporates semantic and structural features 
 - Freeze pre-training parameters + fine-tune top layer 
 
-2. Pronunciation consistency processing: 
--DTW aligns Chinese and English phoneme sequences 
+2. Pronunciation consistency processing:
 - Phoneme similarity calculation module 
 - Multi-task learning framework joint optimization 
 
@@ -479,33 +680,53 @@ def train():  # training and evaluation
 - Custom rhyming accuracy metrics 
 - Sound alignment visualization tool
 """
-
-
 # helper methods
 def visualize_rhythm_gates(model):
     """activation values"""
     import matplotlib.pyplot as plt
-    gates = [gate.gate_net[0].weight.detach().cpu().numpy() for gate in model.rhythm_gates]
+
+    gates = [
+        gate.gate_net[0].weight.detach().cpu().numpy()
+        for gate in model.rhythm_gates
+    ]
+
     plt.figure(figsize=(15, 5))
 
     for idx, gate_weights in enumerate(gates):
         plt.subplot(1, len(gates), idx + 1)
-        plt.hist(gate_weights.ravel(), bins=30, alpha=0.7, edgecolor='black')
-        plt.title(f'Layer {idx} Gate Weights Distribution')
-        plt.xlabel('Activation Value')
-        plt.ylabel('Frequency')
+
+        plt.hist(
+            gate_weights.ravel(),
+            bins=30,
+            alpha=0.7,
+            edgecolor='black'
+        )
+
+        plt.title(
+            f'Layer {idx} Gate Weights Distribution'
+        )
+
+        plt.xlabel(
+            'Activation Value'
+        )
+
+        plt.ylabel(
+            'Frequency'
+        )
 
     plt.tight_layout()
     plt.savefig('rhythm_gates_visualization.png')
     plt.close()
 
-
 def dynamic_curriculum(current_step, total_steps):
-    progress = current_step / total_steps  # Dynamic course learning: Adjust prosody/rhyme loss weights according to training progress
+    progress = current_step / total_steps
+    # Dynamic course learning: Adjust prosody/rhyme loss weights according to training progress
     prosody_weight = 0.8 * (1 + math.cos(
-        math.pi * progress)) / 2  # Adjust prosodic loss weights using cosine annealing (attenuation from 0.8 to 0.2)
+        math.pi * progress)
+    ) / 2  # Adjust prosodic loss weights using cosine annealing (attenuation from 0.8 to 0.2)
+
     rhyme_weight = 0.2 + 0.8 * progress  # The weight of rhyming loss increases with training
     return prosody_weight, rhyme_weight
 
-
-if __name__ == '__main__': train()
+if __name__ == '__main__':
+    train()
