@@ -16,9 +16,10 @@ class PoemDataset(torch.utils.data.Dataset):
         self.max_length = max_length
         self.chinese_tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
         self.english_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        #self.PinYinConverter = PinyinConverter()
 
         self.tone_mapping = {
-            '平': ['1', '2'], '仄': ['3', '4']
+            '平': ['1', '2', '5'], '仄': ['3', '4']
         }  # mapping to flat / sharp tone
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -39,7 +40,7 @@ class PoemDataset(torch.utils.data.Dataset):
         # with open('pinyinDict.json') as f: self.chinese_phonetic_dict = json.load(f)
         # with open('PHONETICDICTIONARY/phonetic-dictionary.json') as f: self.english_phonetic_dict = json.load(f)
     @staticmethod
-    def _load_polyphonic_dict(file_path):
+    def _load_polyphonic_dict(self, file_path):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 raw_dict = json.load(f)
@@ -47,12 +48,10 @@ class PoemDataset(torch.utils.data.Dataset):
             validated_dict = defaultdict(list)
 
             for char, pinyins in raw_dict.items():
-                if not isinstance(pinyins, list):
-                    raise ValueError(f"Invalid pinyin format for {char}, expected list")
-
-                # clean the data and preserve polyphones for Chinese characters
                 cleaned = [
-                    p.strip().lower() for p in pinyins if p.strip()
+                    self.PinYinConverter.convert(p.strip().lower())
+                    for p in pinyins
+                    if p.strip()
                 ]
 
                 if not cleaned:
@@ -111,11 +110,9 @@ class PoemDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def _phonetic_similarity(chn_phon, eng_phon):
-        # chars matching phonetics
         chn_chars = set(chn_phon.replace(' ', ''))
         eng_chars = set(eng_phon.replace(' ', ''))
         common = len(chn_chars & eng_chars)
-
         return common / (len(chn_chars) + len(eng_chars))
 
     def _select_pinyin(self, char):
@@ -137,6 +134,21 @@ So far: The common pronunciation is selected first, and the context-based disamb
             else:
                 return [' '.join(variants)]
         return []
+
+    @staticmethod
+    def _extract_tone_from_pinyin(pinyin_str):
+        tone_map = {
+            'ā': '1', 'á': '2', 'ǎ': '3', 'à': '4',
+            'ē': '1', 'é': '2', 'ě': '3', 'è': '4',
+            'ī': '1', 'í': '2', 'ǐ': '3', 'ì': '4',
+            'ō': '1', 'ó': '2', 'ǒ': '3', 'ò': '4',
+            'ū': '1', 'ú': '2', 'ǔ': '3', 'ù': '4',
+            'ǖ': '1', 'ǘ': '2', 'ǚ': '3', 'ǜ': '4'
+        }
+        for c in pinyin_str:
+            if c in tone_map:
+                return tone_map[c]
+        return '5'
 
     def _get_structural_labels(self, poem):
         valid_poem = [
@@ -161,9 +173,9 @@ So far: The common pronunciation is selected first, and the context-based disamb
             line_labels = []
 
             for char in line:
-                pinyin = self.chinese_phonetic_dict.get(char, '')
-                tone = pinyin[-1] if pinyin else ''
-                label = '平' if tone in self.tone_mapping['平'] else '仄'
+                pinyin = self._select_pinyin(char)
+                tone = self._extract_tone_from_pinyin(pinyin)
+                label = '平' if tone in ['1', '2', '5'] else '仄'
                 line_labels.append(label)
 
             labels.append(''.join(line_labels))

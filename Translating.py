@@ -6,7 +6,6 @@ from transformers import BertTokenizer
 from typing import List, Dict
 from main import PoetryTranslator
 
-
 class PoetryTranslationSystem:
     def __init__(self, model_path: str, device: torch.device = None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -201,13 +200,13 @@ class PoetryTranslationSystem:
 
 
     def evaluate_translation(self, src_poem: str, translation: str) -> Dict:
-        P, R, F1 = self.scorer.score([translation], [src_poem])
+        p, r, f1 = self.scorer.score([translation], [src_poem])
 
         rhyme_acc = self._calculate_rhyme_accuracy(translation)
         rhythm_score = self._calculate_rhythm_match(src_poem, translation)
 
         return {
-            'bert_score': F1.mean().item(),
+            'bert_score': f1.mean().item(),
             'rhyme_accuracy': rhyme_acc,
             'rhythm_similarity': rhythm_score,
             'length_ratio': len(translation) / len(src_poem)
