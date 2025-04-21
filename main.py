@@ -9,11 +9,11 @@ from transformers import BertModel, Trainer, TrainingArguments, BertTokenizer
 from bert_score import BERTScorer
 from collections import defaultdict
 
-class PoemDataset(torch.utils.data.Dataset): # data preprocessing
+class PoemDataset(torch.utils.data.Dataset):
     def __init__(self, data, max_length=512):
+        self.MAX_LINES = 6
         self.data = data
         self.max_length = max_length
-        self.MAX_LINES = 6
         self.chinese_tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
         self.english_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
@@ -37,13 +37,7 @@ class PoemDataset(torch.utils.data.Dataset): # data preprocessing
             )
         )
         '''with open('pinyinDict.json') as f: self.chinese_phonetic_dict = json.load(f)
-        with open('PHONETICDICTIONARY/phonetic-dictionary.json') as f: self.english_phonetic_dict = json.load(f)
-        self.valid_data = []
-        for item in data:
-            if isinstance(item['chinese'], str):
-                item['chinese'] = [s.strip() for s in item['chinese'].split('。') if s.strip()]
-            if self._validate_data(item):
-                self.valid_data.append(item)'''
+        with open('PHONETICDICTIONARY/phonetic-dictionary.json') as f: self.english_phonetic_dict = json.load(f)'''
     @staticmethod
     def _load_polyphonic_dict(file_path):
         try:
@@ -184,7 +178,8 @@ So far: The common pronunciation is selected first, and the context-based disamb
         labels = []
         valid_poem = [
             line.strip()
-            for line in poem if len(line.strip()) > 0
+            for line in poem
+            if len(line.strip()) > 0
         ]
 
         if not valid_poem:
@@ -235,8 +230,7 @@ So far: The common pronunciation is selected first, and the context-based disamb
         return len(self.data)
 
     def __getitem__(self, idx):
-        # data exsts
-        if idx < 0 or idx >= len(self.data):
+        if not (0 < idx <= len(self.data)):
             raise IndexError("Index out of range")
 
         item = self.data[idx]
@@ -455,16 +449,20 @@ So far: The common pronunciation is selected first, and the context-based disamb
             )
         ) / 2.0
 
-        half_match = pron_features['half_match'] + [0.0] * (
+        half_match = (pron_features['half_match'] + [0] *
+            (
                 self.MAX_LINES - len(
                     pron_features['half_match']
                 )
+            )
         )
-
-        consecutive_match = pron_features['consecutive_match'] + [0.0] * (
-                self.MAX_LINES - 1 - len(
-                    pron_features['consecutive_match']
+        consecutive_match = (
+            pron_features['consecutive_match'] + [0] *
+            (
+                    self.MAX_LINES - 1 - len(
+                        pron_features['consecutive_match']
                 )
+            )
         )
 
         return {
@@ -490,9 +488,9 @@ So far: The common pronunciation is selected first, and the context-based disamb
                 dtype=torch.float
             ).unsqueeze(0),
 
-            'structural_tone': structural_tone,  # tensor
-            'structural_rhyme': structural_rhyme,  # tensor
-            'rhyme_pattern': structural_rhyme,  # tensor
+            'structural_tone': structural_tone,
+            'structural_rhyme': structural_rhyme,
+            'rhyme_pattern': structural_rhyme,
 
             "odd_even_match": torch.tensor(
                 pron_features['odd_even_match']
@@ -535,15 +533,17 @@ class BidirectionalEncoder(nn.Module):  #bidirectional structural awareness enco
         tone_emb = self.tone_embedding(structural_tone.to(device))
         rhyme_emb = self.rhyme_embedding(structural_rhyme.to(device))
 
-        hidden_mean = hidden_states.mean(dim=1, keepdim=False)  # (batch_size, 768)
-        tone_mean = tone_emb.mean(dim=1, keepdim=False)  # 改为按序列维度平均
-        rhyme_mean = rhyme_emb.mean(dim=1, keepdim=False)  # 改为按序列维度平均
+        hidden_mean = hidden_states.mean(dim=1, keepdim=False)
+        tone_mean = tone_emb.mean(dim=1, keepdim=False)
+        rhyme_mean = rhyme_emb.mean(dim=1, keepdim=False)
 
-        fusion_input = torch.cat([
-            hidden_mean,
-            tone_mean,
-            rhyme_mean
-        ], dim=-1)
+        fusion_input = torch.cat(
+            [
+                hidden_mean,
+                tone_mean,
+                rhyme_mean
+            ], dim=-1
+        )
 
         fusion_gate = torch.sigmoid(self.fusion_linear(fusion_input))
         return hidden_states * fusion_gate.unsqueeze(1)
@@ -625,7 +625,6 @@ class PoetryTranslator(nn.Module):
 
     def forward(self, input_ids, attention_mask, structural_tone, structural_rhyme,
                 labels, half_match, consecutive_match, odd_even_match, rhyme_pattern, pron_score):
-        # memory(seq_len, batch, hidden)
         memory = self.encoder(
             input_ids,
             attention_mask,
@@ -643,7 +642,9 @@ class PoetryTranslator(nn.Module):
             rhyme_pattern=rhyme_pattern
         )
 
-        logits = self.fc(outputs.permute(1, 0, 2))  # (batch, seq_len, vocab)
+        logits = self.fc(
+            outputs.permute(1, 0, 2)
+        )  # (batch, seq_len, vocab)
 
         translation_loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -657,9 +658,10 @@ class PoetryTranslator(nn.Module):
             pron_score.mean()
         )
 
-        target = torch.tensor(
-            0.8, device=input_ids.device).expand(pronunciation_loss.shape
-        )
+        target = (torch.tensor(
+            0.8, device=input_ids.device)
+                  .expand(pronunciation_loss.shape
+        ))
 
         prone_loss = torch.nn.functional.mse_loss(
             pronunciation_loss, target
@@ -710,27 +712,23 @@ def train():
     args = TrainingArguments(
         output_dir='./results',
         num_train_epochs=16,
-        max_steps=2048,
+        max_steps=512,
         learning_rate=3e-5,
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        logging_steps=100,
+        logging_steps=128,
         save_strategy='steps',
         fp16=False,
-        dataloader_drop_last=True,
         use_cpu=True,
         remove_unused_columns=False
     )
 
     def compute_metrics(pred):
         # decode prediction and tokens
-        tokenizer = dataset.english_tokenizer
-
-        pred_text = tokenizer.batch_decode(
+        pred_text = dataset.english_tokenizer.batch_decode(
             pred.predictions, skip_special_tokens=True
         )
 
-        label_text = tokenizer.batch_decode(
+        label_text = dataset.english_tokenizer.batch_decode(
             pred.label_ids, skip_special_tokens=True
         )
 
@@ -763,8 +761,7 @@ def train():
 - The gating mechanism dynamically incorporates semantic and structural features 
 - Freeze pre-training parameters + fine-tune top layer 
  
-2. Pronunciation consistency processing: 
--DTW aligns Chinese and English phoneme sequences 
+2. Pronunciation consistency processing:
 - Phoneme similarity calculation module 
 - Multi-task learning framework joint optimization 
  

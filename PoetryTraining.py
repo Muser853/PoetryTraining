@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn.functional
 from torch import nn
-from transformers import BertModel, Trainer, TrainingArguments, DataCollatorForSeq2Seq, BertTokenizer
+from transformers import BertModel, Trainer, TrainingArguments, BertTokenizer
 from bert_score import BERTScorer
 from collections import defaultdict
 
@@ -38,12 +38,6 @@ class PoemDataset(torch.utils.data.Dataset):
         )
         # with open('pinyinDict.json') as f: self.chinese_phonetic_dict = json.load(f)
         # with open('PHONETICDICTIONARY/phonetic-dictionary.json') as f: self.english_phonetic_dict = json.load(f)
-        print(list(
-            self.chinese_phonetic_dict.items()
-                   )[0]
-              if self.chinese_phonetic_dict else "Empty dictionary"
-        )
-
     @staticmethod
     def _load_polyphonic_dict(file_path):
         try:
@@ -168,7 +162,7 @@ So far: The common pronunciation is selected first, and the context-based disamb
 
             for char in line:
                 pinyin = self.chinese_phonetic_dict.get(char, '')
-                tone = pinyin[-1] if pinyin and len(pinyin) > 0 else ''
+                tone = pinyin[-1] if pinyin else ''
                 label = '平' if tone in self.tone_mapping['平'] else '仄'
                 line_labels.append(label)
 
@@ -337,9 +331,15 @@ So far: The common pronunciation is selected first, and the context-based disamb
             ])
 
             pron_features['odd_even_match'] = (
-                self._align_pronunciation(odd_phon, odd_eng_phon) +
-                self._align_pronunciation(even_phon, even_eng_phon)
-            ) / 2.0  # average
+                self._align_pronunciation(
+                    odd_phon,
+                    odd_eng_phon
+                ) +
+                self._align_pronunciation(
+                    even_phon,
+                    even_eng_phon
+                )
+            ) / 2.0
 
             half_match = (pron_features['half_match'] + [0]*
                 (
@@ -348,8 +348,9 @@ So far: The common pronunciation is selected first, and the context-based disamb
                     )
                 )
             )
-            consecutive_match = (pron_features['consecutive_match'] + [0]*
-                 (
+            consecutive_match = (
+                pron_features['consecutive_match'] + [0]*
+                (
                         self.MAX_LINES-1 - len(
                              pron_features['consecutive_match']
                       )
@@ -357,16 +358,26 @@ So far: The common pronunciation is selected first, and the context-based disamb
             )
             
             return {
-                'input_ids': src_encoding['input_ids'].squeeze(),
-                'attention_mask': src_encoding['attention_mask'].squeeze(),
-                'labels': eng_encoding['input_ids'].squeeze(),
+                'input_ids': src_encoding[
+                    'input_ids'
+                ].squeeze(0),
+
+                'attention_mask': src_encoding[
+                    'attention_mask'
+                ].squeeze(0),
+
+                'labels': eng_encoding[
+                    'input_ids'
+                ].squeeze(0),
 
                 "half_match": torch.tensor(
-                    half_match, dtype=torch.float
-                ).unsqueeze(0),  # dimension processing
+                    half_match[:self.MAX_LINES],
+                    dtype=torch.float
+                ).unsqueeze(0),
 
                 'consecutive_match': torch.tensor(
-                    consecutive_match, dtype=torch.float
+                    consecutive_match[:self.MAX_LINES-1],
+                    dtype=torch.float
                 ).unsqueeze(0),
 
                 'structural_tone': structural_tone,
@@ -375,9 +386,9 @@ So far: The common pronunciation is selected first, and the context-based disamb
 
                 "odd_even_match": torch.tensor(
                     pron_features['odd_even_match']
-                ),
+                ).unsqueeze(0),
 
-                "pron_score": torch.tensor(pron_score),
+                "pron_score": torch.tensor(pron_score).unsqueeze(0),
             }
         except Exception as e:
             print(f"Error processing item {idx}: {e}")
@@ -399,29 +410,28 @@ class BidirectionalEncoder(nn.Module):  # bidirectional structural awareness enc
             768
         )  # rhyming pattern embeddings
 
-        self.fusion_linear = nn.Linear(
-            2304,
-            768
-        )
+        self.fusion_linear = nn.Linear(2304,768)  # input 768*3 (BERT hidden + tone + rhyme)
 
         # fix BERT parameters
         for param in self.bert.parameters():
             param.requires_grad = False
 
-    def forward(self, input_ids, attention_mask, structural_features):
+    def forward(self, input_ids,
+                attention_mask,
+                structural_tone,
+                structural_rhyme):
+
         device = input_ids.device
         outputs = self.bert(
             input_ids=input_ids, attention_mask=attention_mask
         )
         hidden_states = outputs.last_hidden_state
-        structural_tone = structural_features['tone_labels']
-        structural_rhyme = structural_features['rhyme_pattern']
         tone_emb = self.tone_embedding(structural_tone.to(device))
         rhyme_emb = self.rhyme_embedding(structural_rhyme.to(device))
 
         fusion_input = torch.cat([
-            hidden_states.mean(dim=1),  # (batch_size, 768)
-            tone_emb.mean(dim=1),       # seq dim mean
+            hidden_states.mean(dim=1),
+            tone_emb.mean(dim=1),
             rhyme_emb.mean(dim=1)
             ], dim=-1
         )
@@ -461,19 +471,6 @@ class StructureAwareDecoder(nn.Module):
 
         self.pronunciation_match = PronunciationMatcher()
 
-    def forward(self, x, memory, rhyme_pattern):
-        for layer in self.layers:
-            mask = self._generate_rhyme_mask(
-                pattern=rhyme_pattern,
-                seq_len=x.size(0),  # seq length dimension
-                device=x.device
-            )
-
-            x = layer(x, memory, tgt_mask=mask)
-
-        pron_scores = self.pronunciation_match(memory, x)
-        return x + pron_scores.unsqueeze(-1)
-
     @staticmethod
     def _generate_rhyme_mask(pattern, seq_len, device):
         mask = torch.ones(seq_len, seq_len, device=device)
@@ -482,6 +479,19 @@ class StructureAwareDecoder(nn.Module):
             mask[pos, :] *= 2.0
 
         return mask
+
+    def forward(self, x, memory, rhyme_pattern):
+        for layer in self.layers:
+            mask = self._generate_rhyme_mask(
+                pattern=rhyme_pattern,
+                seq_len=x.size(0),
+                device=x.device
+            )
+
+            x = layer(x, memory, tgt_mask=mask)
+
+        pron_scores = self.pronunciation_match(memory, x)
+        return x + pron_scores.unsqueeze(-1)
 
 class PoetryTranslator(nn.Module):
     def __init__(self):
@@ -499,17 +509,24 @@ class PoetryTranslator(nn.Module):
             768, BertTokenizer.from_pretrained('bert-base-uncased').vocab_size
         )
 
-    def forward(self, input_ids, attention_mask, structural_tone, structural_rhyme,
-                labels, half_match, consecutive_match, odd_even_match, rhyme_pattern):
+    def forward(self,
+                input_ids,
+                attention_mask,
+                structural_tone,
+                structural_rhyme,
+                labels, half_match,
+                consecutive_match,
+                odd_even_match,
+                rhyme_pattern,
+                pron_score):
 
         memory = self.encoder(
             input_ids,
-            attention_mask=attention_mask,
-            structural_features={
-                'tone_labels': structural_tone,
-                'rhyme_pattern': structural_rhyme
-            }
-        ).permute(1, 0, 2)
+            attention_mask,
+            structural_tone,
+            structural_rhyme
+
+        ).permute(1, 0, 2)# (seq_len, batch, 768)
 
         decoder_inputs = labels[ : , : -1]
 
@@ -523,7 +540,7 @@ class PoetryTranslator(nn.Module):
 
         logits = self.fc(
             outputs.permute(1, 0, 2)
-        )
+        )# (batch, seq_len, vocab)
 
         translation_loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -531,18 +548,19 @@ class PoetryTranslator(nn.Module):
         )
 
         pronunciation_loss = (
-                half_match.mean() + consecutive_match.mean() + odd_even_match
+                half_match.mean() +
+                consecutive_match.mean() +
+                odd_even_match +
+                pron_score.mean()
         )
 
-        target = torch.tensor(
-            0.8, device=input_ids.device).expand_as(pronunciation_loss
+        target = (torch.tensor(
+            0.8, device=input_ids.device)
+                  .expand_as(pronunciation_loss
+            )
         )
 
-        prone_loss = torch.nn.functional.mse_loss(
-            pronunciation_loss, target
-        )
-
-        return translation_loss + 0.5 * pronunciation_loss + 0.3 * prone_loss
+        return translation_loss + 0.5 * pronunciation_loss + 0.3 * torch.nn.functional.mse_loss(pronunciation_loss, target)
 
 
 # constraint generation module
@@ -616,22 +634,27 @@ def train():  # training and evaluation
 
     args = TrainingArguments(
         output_dir='./results',
+        num_train_epochs=16,
+        max_steps=512,
         learning_rate=3e-5,
-        per_device_train_batch_size=8,
-        gradient_accumulation_steps=2,
-        fp16=True,
-        logging_steps=100,
-        save_strategy='steps'
+        per_device_train_batch_size=1,
+        logging_steps=128,
+        save_strategy='steps',
+        fp16=False,
+        use_cpu=True,
+        remove_unused_columns = False
     )
 
     def compute_metrics(pred):
         # decode prediction and tokens
         pred_text = [
-            dataset.english_tokenizer.Decode(ids) for ids in pred.predictions
+            dataset.english_tokenizer.Decode(ids)
+            for ids in pred.predictions
         ]
 
         label_text = [
-            dataset.english_tokenizer.Decode(ids) for ids in pred.label_ids
+            dataset.english_tokenizer.Decode(ids)
+            for ids in pred.label_ids
         ]
 
         p, r, f1 = BERTScorer(lang="en", rescale_with_baseline=True).score(cands=pred_text, refs=label_text)
@@ -650,17 +673,10 @@ def train():  # training and evaluation
             'rhyme_acc': rhyme_acc / len(pred_text)
         }
 
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=dataset.english_tokenizer,
-        model=model,
-        padding=True
-    )
-
     trainer = Trainer(
         model=model,
         args=args,
-        train_dataset=[x for x in dataset if x is not None],
-        data_collator=data_collator,
+        train_dataset=dataset,
         compute_metrics=compute_metrics
     )
     trainer.train()
