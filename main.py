@@ -1,4 +1,3 @@
-import re
 import os
 import json
 import math
@@ -8,6 +7,8 @@ from torch import nn
 from transformers import BertModel, Trainer, TrainingArguments, BertTokenizer
 from bert_score import BERTScorer
 from collections import defaultdict
+from PinYinConverter import PinyinConverter
+import re
 
 class PoemDataset(torch.utils.data.Dataset):
     def __init__(self, data, max_length=512):
@@ -16,7 +17,7 @@ class PoemDataset(torch.utils.data.Dataset):
         self.max_length = max_length
         self.chinese_tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
         self.english_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-        #self.PinYinconverter = PinYinConverter()
+        self.PinYinconverter = PinyinConverter()
 
         self.tone_mapping = {
             '平': ['1', '2', '5'], '仄': ['3', '4']
@@ -24,12 +25,7 @@ class PoemDataset(torch.utils.data.Dataset):
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
 
-        self.chinese_phonetic_dict = self._load_polyphonic_dict(
-            os.path.join(
-                script_dir,
-                'pinyinDict.json'
-            )
-        )
+        self.chinese_phonetic_dict = self._load_polyphonic_dict(self, file_path = 'pinyinDict.json')
 
         self.english_phonetic_dict = self._load_phonetic_dict(
             os.path.join(
@@ -48,7 +44,7 @@ class PoemDataset(torch.utils.data.Dataset):
             validated_dict = defaultdict(list)
             for char, pinyins in raw_dict.items():
                 cleaned = [
-                    self.converter.convert(p.strip().lower())
+                    PinyinConverter.convert(self, p.strip().lower())
                     for p in pinyins
                     if p.strip()
                 ]
@@ -249,15 +245,8 @@ class PoemDataset(torch.utils.data.Dataset):
             dtype=torch.long
         )
 
-        src_text = f'[RHYME_SCHEME:{" ".join(
-            structural_labels["rhyme_scheme"]
-        )}] ' \
-                   f'[TONE:{" ".join(
-                       ["".join(l) 
-                        for l in structural_labels["tone_labels"]
-                        ]
-                   )
-                   }] ' \
+        src_text = f'[RHYME_SCHEME:{" ".join(structural_labels["rhyme_scheme"])}] ' \
+                   f'[TONE:{" ".join(["".join(l) for l in structural_labels["tone_labels"]])}] ' \
                    f'[TEXT] ' + ' '.join(chn_lines)
 
         chn_phon = []

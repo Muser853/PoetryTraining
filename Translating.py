@@ -18,8 +18,8 @@ class PoetryTranslationSystem:
         model = PoetryTranslator()
         try:
             model.load_state_dict(torch.load(model_path, map_location=self.device))
-        except RuntimeError as e:
-            raise RuntimeError(f"model loading failed: {str(e)}. Please check if the model framework fits") from e
+        except RuntimeError as ex:
+            raise RuntimeError(f"model loading failed: {str(ex)}. Please check if the model framework fits") from ex
         model.eval()
         return model.to(self.device)
 
@@ -38,34 +38,60 @@ class PoetryTranslationSystem:
             with open("PHONETICDICTIONARY/phonetic-dictionary.json") as f:
                 eng_phonetic = json.load(f)
             return {'chinese': chn_phonetic, 'english': eng_phonetic}
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"no photic dictionary found: {str(e)}") from e
+        except FileNotFoundError as ex:
+            raise FileNotFoundError(f"no photic dictionary found: {str(ex)}") from ex
 
     def _calculate_rhythm_match(self, src_poem: str, translation: str) -> float:
-        src_lines = [line.strip() for line in src_poem.split('，') if line.strip()]
-        tgt_lines = [line.strip() for line in translation.split('\n') if line.strip()]
+        src_rhythm = self._extract_chinese_rhythm(src_poem)
+        tgt_rhythm = self._extract_english_rhythm(translation)
 
-        if not src_lines or not tgt_lines:
+        if not src_rhythm or not tgt_rhythm:
             return 0.0
 
-        src_rhythm = []
-        for char in ''.join(src_lines):
-            pinyins = self.phonetic_dicts['chinese'].get(char, [''])
-            src_rhythm.append('平' if pinyins and pinyins[0][-1] in {'1', '2'} else '仄')
+        # DTW cost matrix
+        n, m = len(src_rhythm), len(tgt_rhythm)
+        dp = [[float('inf')] * (m + 1) for _ in range(n + 1)]
+        dp[0][0] = 0
 
-        # end rhyme
-        tgt_rhythm = []
-        for line in tgt_lines:
+        # dynamic filling
+        for i in range(n):
+            for j in range(m):
+                cost = self._rhythm_similarity(src_rhythm[i], tgt_rhythm[j])
+                dp[i + 1][j + 1] = min(
+                    dp[i][j] + cost * 2,  # replace
+                    dp[i][j + 1] + 1,  # inset
+                    dp[i + 1][j] + 1  # delete
+                )
+        max_possible = max(n, m) * 2
+        similarity = 1 - (dp[n][m] / max_possible)
+        return similarity
+
+    def _extract_chinese_rhythm(self, poem: str) -> List[str]:
+        lines = [line.strip() for line in poem.split('，') if line.strip()]
+        rhythm = []
+        for line in lines:
+            for char in line:
+                pinyins = self.phonetic_dicts['chinese'].get(char, [''])
+                tone = pinyins[0][-1] if pinyins else ''
+                rhythm.append('flat' if tone in {'1', '2'} else 'sharp')
+        return rhythm
+
+    def _extract_english_rhythm(self, translation: str) -> List[str]:
+        lines = [line.strip() for line in translation.split('\n') if line.strip()]
+        rhythm = []
+        for line in lines:
             words = line.split()
-            if not words:
-                continue
-            last_word = words[-1].lower()
-            stress = self.phonetic_dicts['english'].get(last_word, [''])[0]
-            tgt_rhythm.append('强' if '1' in stress else '弱' if '0' in stress else '')
-
-        # 简单比例匹配（实际可改进为动态规划对齐）
-        match_count = sum(1 for s, t in zip(src_rhythm, tgt_rhythm) if s and t and s[0] == t[0])
-        return match_count / max(len(src_rhythm), 1)
+            for word in words:
+                phoneme = self.phonetic_dicts['english'].get(word.lower(), [''])[0]
+                rhythm.append('strong' if '1' in phoneme else 'weak')
+        return rhythm
+    @staticmethod
+    def _rhythm_similarity(s: str, t: str) -> float:
+        if s == 'flat' and t == 'strong': return 1.0
+        if s == 'sharp' and t == 'weak': return 1.0
+        if s == 'flat' and t == 'weak': return 0.3
+        if s == 'sharp' and t == 'strong': return 0.3
+        return 0.0
 
     def _calculate_rhyme_accuracy(self, translation: str) -> float:
 
@@ -95,7 +121,7 @@ class PoetryTranslationSystem:
             for char in line:
                 pinyins = self.phonetic_dicts['chinese'].get(char, [''])
                 tone = pinyins[0][-1] if pinyins else ''
-                label = '平' if tone in {'1', '2'} else '仄' if tone else '未知'
+                label = 'flat' if tone in {'1', '2'} else 'sharp' if tone else '未知'
                 line_tones.append(label)
             tone_labels.append(''.join(line_tones))
 
@@ -237,8 +263,8 @@ class PoetryTranslationSystem:
                     translation = self.translate(user_input)
                     print(f"\nTranslation Results:\n{translation}")
 
-            except Exception as e:
-                print(f"process error: {str(e)}")
+            except Exception as ex:
+                print(f"process error: {str(ex)}")
 
     def _format_input(self, poem: str) -> str:
         structure = self._analyze_poem_structure(poem)
@@ -273,15 +299,14 @@ class PoetryTranslationSystem:
 
     @staticmethod
     def _show_help() -> None:
-        """显示帮助信息"""
         print("""
-        系统命令说明:
-        :q      - 退出系统
-        :v 诗歌 - 可视化诗歌韵律结构
-        :e 诗歌 - 评估翻译质量
-        :help   - 显示本帮助
+        instructions:
+        :q      - quit
+        :v  - visualize poem rhythm structure
+        :e  - evaluate translation quality
+        :help   - display
 
-        示例输入:
+        example input:
         床前明月光，疑是地上霜。
         :v 春风得意马蹄疾，一日看尽长安花
         """)
@@ -290,13 +315,13 @@ class PoetryTranslationSystem:
 if __name__ == "__main__":
     try:
         translator = PoetryTranslationSystem(
-            model_path="/Users/wangmin/Desktop/TransPOE/RHYTHM/poetry_translator_20250412_180917.pth"
+            model_path="/Users/wangmin/Desktop/TransPOE/RHYTHM/results/checkpoint-512/model.safetensors"
         )
         translator.interactive_session()
 
     except FileNotFoundError as e:
-        print(f"关键文件缺失: {str(e)}")
+        print(f"file not found: {str(e)}")
     except RuntimeError as e:
-        print(f"模型初始化失败: {str(e)}")
+        print(f"model initialization failed: {str(e)}")
     except Exception as e:
-        print(f"系统初始化异常: {str(e)}")
+        print(f"system initialization failed: {str(e)}")

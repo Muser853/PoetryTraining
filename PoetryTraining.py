@@ -1,13 +1,15 @@
-import re
 import os
 import json
 import math
+from typing import Any
 import torch
 import torch.nn.functional
 from torch import nn
 from transformers import BertModel, Trainer, TrainingArguments, BertTokenizer
 from bert_score import BERTScorer
 from collections import defaultdict
+from PinYinConverter import PinyinConverter
+import re
 
 class PoemDataset(torch.utils.data.Dataset):
     def __init__(self, data, max_length=512):
@@ -16,20 +18,15 @@ class PoemDataset(torch.utils.data.Dataset):
         self.max_length = max_length
         self.chinese_tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
         self.english_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-        #self.PinYinConverter = PinyinConverter()
+        self.PinYinConverter = PinyinConverter()
 
         self.tone_mapping = {
-            '平': ['1', '2', '5'], '仄': ['3', '4']
+            'flat': ['1', '2', '5'], 'sharp': ['3', '4']
         }  # mapping to flat / sharp tone
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
 
-        self.chinese_phonetic_dict = self._load_polyphonic_dict(
-            os.path.join(
-                script_dir,
-                'pinyinDict.json'
-            )
-        )
+        self.chinese_phonetic_dict = self._load_polyphonic_dict(file_path = 'pinyinDict.json')
 
         self.english_phonetic_dict = self._load_phonetic_dict(
             os.path.join(
@@ -39,8 +36,7 @@ class PoemDataset(torch.utils.data.Dataset):
         )
         # with open('pinyinDict.json') as f: self.chinese_phonetic_dict = json.load(f)
         # with open('PHONETICDICTIONARY/phonetic-dictionary.json') as f: self.english_phonetic_dict = json.load(f)
-    @staticmethod
-    def _load_polyphonic_dict(self, file_path):
+    def _load_polyphonic_dict(self, file_path) -> defaultdict[Any, list]:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 raw_dict = json.load(f)
@@ -49,11 +45,10 @@ class PoemDataset(torch.utils.data.Dataset):
 
             for char, pinyins in raw_dict.items():
                 cleaned = [
-                    self.PinYinConverter.convert(p.strip().lower())
+                    self.PinYinConverter.reverse_convert(p.strip().lower())
                     for p in pinyins
                     if p.strip()
                 ]
-
                 if not cleaned:
                     raise ValueError(f"No valid pinyin for {char}")
 
@@ -175,7 +170,7 @@ So far: The common pronunciation is selected first, and the context-based disamb
             for char in line:
                 pinyin = self._select_pinyin(char)
                 tone = self._extract_tone_from_pinyin(pinyin)
-                label = '平' if tone in ['1', '2', '5'] else '仄'
+                label = 'flat' if tone in ['1', '2', '5'] else 'sharp'
                 line_labels.append(label)
 
             labels.append(''.join(line_labels))
@@ -219,7 +214,7 @@ So far: The common pronunciation is selected first, and the context-based disamb
             structural_features = self._get_structural_labels(chn_lines)
 
             structural_tone = torch.tensor(
-                [0 if c == '平' else 1 for c in ''.join(structural_features['tone_labels'])],
+                [0 if c == 'flat' else 1 for c in ''.join(structural_features['tone_labels'])],
                 dtype=torch.long
             )
             structural_rhyme = torch.tensor(
