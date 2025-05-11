@@ -17,7 +17,7 @@ class PoetryTranslationSystem:
     def _init_model(self, model_path: str) -> PoetryTranslator:
         model = PoetryTranslator()
         try:
-            model.load_state_dict(torch.load(model_path, map_location=self.device))
+            model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=False))
         except RuntimeError as ex:
             raise RuntimeError(f"model loading failed: {str(ex)}. Please check if the model framework fits") from ex
         model.eval()
@@ -291,10 +291,10 @@ class PoetryTranslationSystem:
     def _format_metrics(metrics: Dict) -> str:
         """格式化评估结果"""
         return (
-            f"• BERT分数: {metrics['bert_score']:.3f}\n"
-            f"• 押韵准确率: {metrics['rhyme_accuracy']:.1%}\n"
-            f"• 节奏相似度: {metrics['rhythm_similarity']:.2f}\n"
-            f"• 长度比例: {metrics['length_ratio']:.2f}"
+            f"• BERT score: {metrics['bert_score']:.3f}\n"
+            f"• rhyme accuracy: {metrics['rhyme_accuracy']:.1%}\n"
+            f"• rhyme similarity: {metrics['rhythm_similarity']:.2f}\n"
+            f"• length ration: {metrics['length_ratio']:.2f}"
         )
 
     @staticmethod
